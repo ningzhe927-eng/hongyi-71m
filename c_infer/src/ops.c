@@ -4,6 +4,21 @@
 #include <stdint.h>
 #include <string.h>
 
+/* ---- ISA 变体改名（MT_ISA=portable 时由 CMake 传 -DMT_ISA_SUFFIX）----
+ * ⚠ 必须排在 `#include "ops.h"` **之后**：头里的声明保持**对外名**（由 isa_dispatch.c 提供）。
+ * 本文件的定义改名成 mt_xxx_scalar / mt_xxx_avx512，供同一份源码编译两遍。 */
+#include "isa_suffix.h"
+#define mt_rmsnorm          MT_ISAN(mt_rmsnorm)
+#define mt_silu_mul         MT_ISAN(mt_silu_mul)
+#define mt_silu_mul2        MT_ISAN(mt_silu_mul2)
+#define mt_sigmoid2         MT_ISAN(mt_sigmoid2)
+#define mt_add_inplace      MT_ISAN(mt_add_inplace)
+#define mt_softmax_rows     MT_ISAN(mt_softmax_rows)
+#define mt_log_softmax      MT_ISAN(mt_log_softmax)
+#define mt_log_softmax_rows MT_ISAN(mt_log_softmax_rows)
+#define mt_argmax           MT_ISAN(mt_argmax)
+#define mt_topk             MT_ISAN(mt_topk)
+
 static inline float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 #ifdef _OPENMP
@@ -12,6 +27,11 @@ static inline float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
 #if defined(__AVX512F__) && defined(__AVX512VL__)
 #include <immintrin.h>
 #define MT_EXPF8 1
+#define MT_EXPF8_512 1          /* 512 位 double 多项式 + vpermi2q 查表 */
+#elif defined(MT_EXPF8_AVX2)
+#include <immintrin.h>
+#define MT_EXPF8 1
+/* 256 位 double 多项式 + i32gather 查表（见下方 AVX2 分支） */
 #endif
 
 #ifdef MT_EXPF8
@@ -49,6 +69,25 @@ static const uint64_t MT_EXPF_TAB[32] = {
 #define MT_EXPF_C1 (0x1.ebfce50fac4f3p-3 / 1024.0)    /* poly_scaled[1] = p1/N^2 */
 #define MT_EXPF_C2 (0x1.62e42ff0c52d6p-1 / 32.0)      /* poly_scaled[2] = p2/N   */
 
+/* ---- logf 的查表 / 常量（**两个变体共享**，必须放在 ISA 分叉之前）---- */
+static const double MT_LOGF_INVC[16] = {
+0x1.661ec79f8f3bep+0, 0x1.571ed4aaf883dp+0, 0x1.49539f0f010bp+0, 0x1.3c995b0b80385p+0,
+0x1.30d190c8864a5p+0, 0x1.25e227b0b8eap+0, 0x1.1bb4a4a1a343fp+0, 0x1.12358f08ae5bap+0,
+0x1.0953f419900a7p+0, 0x1p+0,               0x1.e608cfd9a47acp-1, 0x1.ca4b31f026aap-1,
+0x1.b2036576afce6p-1, 0x1.9c2d163a1aa2dp-1, 0x1.886e6037841edp-1, 0x1.767dcf5534862p-1,
+};
+static const double MT_LOGF_LOGC[16] = {
+-0x1.57bf7808caadep-2, -0x1.2bef0a7c06ddbp-2, -0x1.01eae7f513a67p-2, -0x1.b31d8a68224e9p-3,
+-0x1.6574f0ac07758p-3, -0x1.1aa2bc79c81p-3,  -0x1.a4e76ce8c0e5ep-4, -0x1.1973c5a611cccp-4,
+-0x1.252f438e10c1ep-5, 0x0p+0,               0x1.aa5aa5df25984p-5,  0x1.c5e53aa362eb4p-4,
+0x1.526e57720db08p-3,  0x1.bc2860d22477p-3,  0x1.1058bc8a07ee1p-2,  0x1.4043057b6ee09p-2,
+};
+#define MT_LOGF_LN2 0x1.62e42fefa39efp-1
+#define MT_LOGF_A0 (-0x1.00ea348b88334p-2)
+#define MT_LOGF_A1 ( 0x1.5575b0be00b6ap-2)
+#define MT_LOGF_A2 (-0x1.ffffef20a4123p-2)
+
+#ifdef MT_EXPF8_512
 static inline __m512d mt_expf_core_pd(__m512d xd) {
   const __m512d vinv = _mm512_set1_pd(MT_EXPF_INVLN2N), vsh = _mm512_set1_pd(MT_EXPF_SHIFT);
   const __m512d vc0 = _mm512_set1_pd(MT_EXPF_C0), vc1 = _mm512_set1_pd(MT_EXPF_C1);
@@ -111,23 +150,6 @@ static inline __m256 mt_expf8(__m256 x) {
  * 🔴 三个坑：① 多项式仍用 mul+add（别用 fma）；② 越界判据必须是**无符号**比较
  *    （`ix - 0x00800000 >= 0x7f000000`，写成有符号会让次正规/0/负数漏掉回退）；
  *    ③ x==1 要单独贴 0（glibc 在 WANT_ROUNDING 下直接返回 0）。 */
-static const double MT_LOGF_INVC[16] = {
-0x1.661ec79f8f3bep+0, 0x1.571ed4aaf883dp+0, 0x1.49539f0f010bp+0, 0x1.3c995b0b80385p+0,
-0x1.30d190c8864a5p+0, 0x1.25e227b0b8eap+0, 0x1.1bb4a4a1a343fp+0, 0x1.12358f08ae5bap+0,
-0x1.0953f419900a7p+0, 0x1p+0,               0x1.e608cfd9a47acp-1, 0x1.ca4b31f026aap-1,
-0x1.b2036576afce6p-1, 0x1.9c2d163a1aa2dp-1, 0x1.886e6037841edp-1, 0x1.767dcf5534862p-1,
-};
-static const double MT_LOGF_LOGC[16] = {
--0x1.57bf7808caadep-2, -0x1.2bef0a7c06ddbp-2, -0x1.01eae7f513a67p-2, -0x1.b31d8a68224e9p-3,
--0x1.6574f0ac07758p-3, -0x1.1aa2bc79c81p-3,  -0x1.a4e76ce8c0e5ep-4, -0x1.1973c5a611cccp-4,
--0x1.252f438e10c1ep-5, 0x0p+0,               0x1.aa5aa5df25984p-5,  0x1.c5e53aa362eb4p-4,
-0x1.526e57720db08p-3,  0x1.bc2860d22477p-3,  0x1.1058bc8a07ee1p-2,  0x1.4043057b6ee09p-2,
-};
-#define MT_LOGF_LN2 0x1.62e42fefa39efp-1
-#define MT_LOGF_A0 (-0x1.00ea348b88334p-2)
-#define MT_LOGF_A1 ( 0x1.5575b0be00b6ap-2)
-#define MT_LOGF_A2 (-0x1.ffffef20a4123p-2)
-
 static inline __m512d mt_logf_core_pd(__m256i ix) {
   const __m512d vln2 = _mm512_set1_pd(MT_LOGF_LN2), va0 = _mm512_set1_pd(MT_LOGF_A0);
   const __m512d va1 = _mm512_set1_pd(MT_LOGF_A1), va2 = _mm512_set1_pd(MT_LOGF_A2);
@@ -168,6 +190,99 @@ static inline __m256 mt_logf8(__m256 x) {
   }
   return y;
 }
+#else /* !MT_EXPF8_512 ⇒ AVX2 变体 */
+
+/* ================= AVX2：256 位 double 多项式 + i32gather 查表 =================
+ * ⚠ AVX2 **没有 `vpermi2q`**（AVX-512 的跨 128 位通道、64 位变址置换）⇒ 查表改走
+ *    `_mm256_i32gather_epi64` / `_mm256_i32gather_pd`（每次 4 车道；比 permute 慢但正确）。
+ *    索引直接用 `k & 31`（AVX-512 版因为一个 zmm 只装 8 个 qword，要拆两次 permute + 按 bit4 blend；
+ *    AVX2 一次 gather 就能横跨全表 32 项 ⇒ 更简单）。
+ * ✅ 多项式与 512 版**逐步相同**（mul + add、**无 fma**）⇒ 与标量/AVX-512 **逐位一致**。
+ * 🔴 别改成 fma / 别合并成 FMA 形式：会少一次舍入 ⇒ 差 1 ULP ⇒ 穿透 int8 量化边界。 */
+static inline __m256d mt_expf_core_4d(__m256d xd) {
+  const __m256d vinv = _mm256_set1_pd(MT_EXPF_INVLN2N), vsh = _mm256_set1_pd(MT_EXPF_SHIFT);
+  const __m256d vc0 = _mm256_set1_pd(MT_EXPF_C0), vc1 = _mm256_set1_pd(MT_EXPF_C1);
+  const __m256d vc2 = _mm256_set1_pd(MT_EXPF_C2), vone = _mm256_set1_pd(1.0);
+  __m256d z = _mm256_mul_pd(vinv, xd);
+  __m256d kd0 = _mm256_add_pd(z, vsh);                    /* ⇒ 取整（ties-to-even）*/
+  __m256i ki = _mm256_castpd_si256(kd0);
+  __m256d kd = _mm256_sub_pd(kd0, vsh);
+  __m256d r = _mm256_sub_pd(z, kd);
+  /* 4 个 qword 的低 dword = k（低 5 位即表索引） */
+  __m128i k32 = _mm256_castsi256_si128(
+      _mm256_permutevar8x32_epi32(ki, _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7)));
+  __m128i i31 = _mm_and_si128(k32, _mm_set1_epi32(31));
+  __m256i t = _mm256_i32gather_epi64((const long long *)MT_EXPF_TAB, i31, 8);
+  t = _mm256_add_epi64(t, _mm256_slli_epi64(ki, 52 - 5));
+  __m256d s = _mm256_castsi256_pd(t);
+  __m256d z2v = _mm256_add_pd(_mm256_mul_pd(vc0, r), vc1);
+  __m256d r2 = _mm256_mul_pd(r, r);
+  __m256d y = _mm256_add_pd(_mm256_mul_pd(vc2, r), vone);
+  y = _mm256_add_pd(_mm256_mul_pd(z2v, r2), y);
+  return _mm256_mul_pd(y, s);
+}
+
+/* 8 lane float → 8 lane float（两条 4-double 通道；越界/NaN 用 AVX2 的 cmp+blendv 贴回，
+ *  与 AVX-512 版的 mask_blend 语义一致：y ← big?+inf / sml?0 / nan?x+x） */
+static inline __m256 mt_expf8(__m256 x) {
+  __m256d cl = mt_expf_core_4d(_mm256_cvtps_pd(_mm256_castps256_ps128(x)));
+  __m256d ch = mt_expf_core_4d(_mm256_cvtps_pd(_mm256_extractf128_ps(x, 1)));
+  __m256 y = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm256_cvtpd_ps(cl)),
+                                  _mm256_cvtpd_ps(ch), 1);
+  __m256 nanm = _mm256_cmp_ps(x, x, _CMP_UNORD_Q);
+  __m256 bigm = _mm256_cmp_ps(x, _mm256_set1_ps(0x1.62e42ep6f), _CMP_GT_OQ);
+  __m256 smlm = _mm256_cmp_ps(x, _mm256_set1_ps(-0x1.9d1d9ep6f), _CMP_LT_OQ);
+  if (__builtin_expect((unsigned)(_mm256_movemask_ps(nanm) | _mm256_movemask_ps(bigm)
+                                  | _mm256_movemask_ps(smlm)) != 0, 0)) {
+    if (_mm256_movemask_ps(bigm)) y = _mm256_blendv_ps(y, _mm256_set1_ps(INFINITY), bigm);
+    if (_mm256_movemask_ps(smlm)) y = _mm256_blendv_ps(y, _mm256_setzero_ps(), smlm);
+    if (_mm256_movemask_ps(nanm)) y = _mm256_blendv_ps(y, _mm256_add_ps(x, x), nanm);
+  }
+  return y;
+}
+
+static inline __m256d mt_logf_core_4d(__m128i ix) {
+  const __m256d vln2 = _mm256_set1_pd(MT_LOGF_LN2), va0 = _mm256_set1_pd(MT_LOGF_A0);
+  const __m256d va1 = _mm256_set1_pd(MT_LOGF_A1), va2 = _mm256_set1_pd(MT_LOGF_A2);
+  const __m256d one = _mm256_set1_pd(1.0);
+  const __m128i voff = _mm_set1_epi32(0x3f330000);
+  __m128i tmp = _mm_sub_epi32(ix, voff);
+  __m128i ii = _mm_and_si128(_mm_srli_epi32(tmp, 23 - 4), _mm_set1_epi32(15));
+  __m128i kk = _mm_srai_epi32(tmp, 23);                   /* 算术右移（有符号）*/
+  __m128i iz = _mm_sub_epi32(ix, _mm_and_si128(tmp, _mm_set1_epi32((int)(0x1ffu << 23))));
+  __m256d invc = _mm256_i32gather_pd(MT_LOGF_INVC, ii, 8);
+  __m256d logc = _mm256_i32gather_pd(MT_LOGF_LOGC, ii, 8);
+  __m256d z = _mm256_cvtps_pd(_mm_castsi128_ps(iz));
+  __m256d r = _mm256_sub_pd(_mm256_mul_pd(z, invc), one);
+  __m256d y0 = _mm256_add_pd(logc, _mm256_mul_pd(_mm256_cvtepi32_pd(kk), vln2));
+  __m256d r2 = _mm256_mul_pd(r, r);
+  __m256d y = _mm256_add_pd(_mm256_mul_pd(va1, r), va2);
+  y = _mm256_add_pd(_mm256_mul_pd(va0, r2), y);
+  return _mm256_add_pd(_mm256_mul_pd(y, r2), _mm256_add_pd(y0, r));
+}
+
+static inline __m256 mt_logf8(__m256 x) {
+  __m256i ix = _mm256_castps_si256(x);
+  __m256i m1 = _mm256_cmpeq_epi32(ix, _mm256_set1_epi32(0x3f800000));      /* x == 1 */
+  /* 无符号 `sub >= 0x7f000000`：AVX2 没有无符号比较 ⇒ 用 max_epu32 判等 */
+  __m256i bound = _mm256_set1_epi32((int)0x7f000000u);
+  __m256i sub = _mm256_sub_epi32(ix, _mm256_set1_epi32(0x00800000));
+  __m256i bad = _mm256_cmpeq_epi32(_mm256_max_epu32(sub, bound), bound);
+  __m256i fast = _mm256_xor_si256(_mm256_or_si256(m1, bad), _mm256_set1_epi32(-1));
+  __m256d cl = mt_logf_core_4d(_mm_castps_si128(_mm256_castps256_ps128(x)));
+  __m256d ch = mt_logf_core_4d(_mm_castps_si128(_mm256_extractf128_ps(x, 1)));
+  __m256 y = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm256_cvtpd_ps(cl)),
+                                  _mm256_cvtpd_ps(ch), 1);
+  y = _mm256_blendv_ps(y, _mm256_setzero_ps(), _mm256_castsi256_ps(m1));
+  if (__builtin_expect(_mm256_movemask_ps(_mm256_castsi256_ps(bad)) != 0, 0)) {
+    float xa[8], ya[8];
+    _mm256_storeu_ps(xa, x);
+    for (int i = 0; i < 8; i++) if (!((_mm256_movemask_ps(_mm256_castsi256_ps(fast)) >> i) & 1)) ya[i] = logf(xa[i]);
+    y = _mm256_blendv_ps(_mm256_loadu_ps(ya), y, _mm256_castsi256_ps(fast));
+  }
+  return y;
+}
+#endif /* MT_EXPF8_512 / AVX2 分支 */
 #endif /* MT_EXPF8 */
 
 void mt_rmsnorm(float *out, const float *x, const float *w, int rows, int dim, float eps) {
@@ -278,30 +393,42 @@ void mt_softmax_rows(float *x, int rows, int n) {
   }
 }
 
-void mt_log_softmax(float *x, int n) {
-  /* 🔴 2026-10-01 修复：原来写作 x[i] = log(e_i) - (log s + m)，把 m 减了两次
-   *   （log(e_i)=x_i-m，正确结果是 x_i-m-log s）。greedy 走 argmax 对常数平移不敏感，
-   *   所以只在 beam search 里暴露。 */
-  float m = -FLT_MAX;
+/* 线程数由**工作量**派生，不由机器核数派生。
+ * 🔴 为什么不能用 omp_get_max_threads()：128 核机器上 V=30008 只够切 8 个 chunk
+ *   （每线程 4096 元素），若起 128 线程 ⇒ 104 个线程各拿 1 个、剩余唤醒即空转 ⇒ 净亏。
+ *   本机（8 线程）算出来正好是 8 ⇒ 与历史行为一致；4 核机器自动降到 4。
+ *   env：MT_LS_PER_THREAD（每线程最小元素数，默认 4096）。 */
+static int mt_chunk_threads(long long n) {
 #ifdef _OPENMP
-  if (n >= 4096) {   /* 🆕 这一趟原来单线程（beam 每步 4 行 × 30K）；按"严格 >"规则分块归约，逐位等价 */
-    const int T = 8;
-    float pm[8];
-#pragma omp parallel for schedule(static) num_threads(T)
-    for (int t = 0; t < T; t++) {
-      const int lo = (int)((long)t * n / T), hi = (int)((long)(t + 1) * n / T);
-      float v = -FLT_MAX;
-      for (int j = lo; j < hi; j++) if (x[j] > v) v = x[j];
-      pm[t] = v;
-    }
-    for (int t = 0; t < T; t++) if (pm[t] > m) m = pm[t];
-  } else
+  const char *e = getenv("MT_LS_PER_THREAD");
+  int per = (e && *e) ? atoi(e) : 4096;
+  if (per < 256) per = 256;
+  long long t = (n + per - 1) / per;
+  int mx = omp_get_max_threads();
+  long long r = t < mx ? t : mx;
+  return (int)(r < 1 ? 1 : r);
+#else
+  (void)n; return 1;
 #endif
+}
+static int mt_ls_min(void) {
+  const char *e = getenv("MT_LS_MIN");
+  int v = (e && *e) ? atoi(e) : 8192;
+  return v;
+}
+
+#define MT_LS_ROWS_MAX 256
+
+/* 一行「max 趟 + exp 趟 + log 趟」的完整串行实现，返回 ls=log(sum)。
+ * 🔴 逐步位口径与原串行实现一字不差：max 用严格 >；s 按 i 顺序累加；logf 逐元素应用。
+ *   nb>=0 ⇒ log 趟只处理尾巴 [nb*8, n)（对齐块交给调用方的并行段）；
+ *   nb<0  ⇒ log 趟处理整行（非 SIMD 构建走这条）。 */
+static float mt_ls_row(float *x, int n, int nb) {
+  float m = -FLT_MAX;
   for (int i = 0; i < n; i++) if (x[i] > m) m = x[i];
   float s = 0.f;
   int i = 0;
 #ifdef MT_EXPF8
-  /* expf 走位精确 SIMD（见 mt_silu_mul2 的说明）；求和仍**按 i 顺序串行**加 */
   const __m256 vm = _mm256_set1_ps(m);
   float eb[8];
   for (; i + 8 <= n; i += 8) {
@@ -314,23 +441,89 @@ void mt_log_softmax(float *x, int n) {
 #endif
   for (; i < n; i++) { float e = expf(x[i] - m); x[i] = e; s += e; }
   const float ls = logf(s);
-  i = 0;
+  int lo;
 #ifdef MT_EXPF8
-  {   /* 这一趟是全词表 30K 次 logf（beam 的 log_softmax 里最贵的一段）⇒ 位精确 SIMD + 多线程
-       （逐元素、无归约 ⇒ 并行不改数值；块边界按 8 对齐，尾巴留给串行段）*/
-    const __m256 vls = _mm256_set1_ps(ls);
-    const int nb = n >> 3;                 /* 8 元素块数 */
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if(nb >= 4096)
+  lo = (nb >= 0) ? nb * 8 : 0;                  /* SIMD 块已处理过的前缀不用再做 */
+#else
+  lo = 0;                                        /* 无 SIMD ⇒ 整行都走标量 logf */
 #endif
-    for (int b = 0; b < nb; b++) {
-      const int o = b << 3;
-      _mm256_storeu_ps(x + o, _mm256_sub_ps(mt_logf8(_mm256_loadu_ps(x + o)), vls));
+  for (int j = lo; j < n; j++) x[j] = logf(x[j]) - ls;   /* log(e_i / s) = x_i - m - log s */
+  return ls;
+}
+
+/* 行级 log_softmax：一次调用做完所有行的三趟。
+ * 🔴 与「逐行调用 mt_log_softmax」逐位等价：每行调用的是同一个 mt_ls_row，
+ *   行间完全独立（缓冲不重叠）⇒ 跨行的调度顺序不影响任何一行的值。
+ * ⚠ 必须从**串行上下文**调用：若外层已在 omp parallel 内，嵌套默认关闭 ⇒ 退化为串行。
+ *   （decode.c 的批内 beam 原本是「外层按行并行 + 行内两趟」，行内两趟因嵌套关闭全部
+ *    串行化了，改成本函数后由**一个** region 覆盖所有任务。） */
+void mt_log_softmax_rows(float *x, int n, const int *ridx, int nrows) {
+  if (nrows <= 0 || n <= 0) return;
+  /* SIMD logf 块数（8 元素/块）。非 MT_EXPF8 构建下 nb=0 ⇒ 整行走标量，
+   * mt_ls_row 收到的 nb<0 ⇒ 它自己把整行的 log 趟做完。 */
+  int nb = 0, row_nb = -1;
+#ifdef MT_EXPF8
+  nb = n >> 3; row_nb = nb;
+#endif
+  const long long total = (long long)nrows * n;
+  float ls[MT_LS_ROWS_MAX];
+  float *pls = ls;
+  if (nrows > MT_LS_ROWS_MAX) {               /* 兜底：分块处理，永不栈溢出 */
+    int done = 0;
+    while (done < nrows) {
+      int chunk = nrows - done > MT_LS_ROWS_MAX ? MT_LS_ROWS_MAX : nrows - done;
+      mt_log_softmax_rows(x, n, ridx ? ridx + done : NULL, chunk);
+      done += chunk;
     }
-    i = nb << 3;
+    return;
+  }
+  int T = mt_chunk_threads(total);
+  int dopar = 0;
+#ifdef _OPENMP
+  dopar = (T >= 2) && (total >= mt_ls_min());
+#endif
+  if (!dopar) {
+    for (int r = 0; r < nrows; r++) {
+      float *p = x + (size_t)(ridx ? ridx[r] : r) * n;
+      const float lsr = mt_ls_row(p, n, row_nb);
+#ifdef MT_EXPF8
+      const __m256 vls = _mm256_set1_ps(lsr);
+      for (int b = 0; b < nb; b++)
+        _mm256_storeu_ps(p + (b << 3),
+          _mm256_sub_ps(mt_logf8(_mm256_loadu_ps((const float *)(p + (b << 3)))), vls));
+#endif
+    }
+    (void)pls;
+    return;
+  }
+#ifdef _OPENMP
+  #pragma omp parallel num_threads(T)
+  {
+    #pragma omp for schedule(static)
+    for (int r = 0; r < nrows; r++)
+      pls[r] = mt_ls_row(x + (size_t)(ridx ? ridx[r] : r) * n, n, row_nb);
+#ifdef MT_EXPF8
+    /* 第三趟：(行,块) 扁平并行 ⇒ 解决原来 schedule(static) 在 nrows 非 T 倍数时的尾倾斜
+     *   （例：nrows=17、T=8 ⇒ 关键路径 3 行 = 理想的 1.5×）。逐元素无归约 ⇒ 不改数值。 */
+    #pragma omp for collapse(2) schedule(static)
+    for (int r = 0; r < nrows; r++)
+      for (int b = 0; b < nb; b++) {
+        float *p = x + (size_t)(ridx ? ridx[r] : r) * n;
+        const __m256 vls = _mm256_set1_ps(pls[r]);
+        _mm256_storeu_ps(p + (b << 3),
+          _mm256_sub_ps(mt_logf8(_mm256_loadu_ps((const float *)(p + (b << 3)))), vls));
+      }
+#endif
   }
 #endif
-  for (; i < n; i++) x[i] = logf(x[i]) - ls;         /* log(e_i / s) = x_i - m - log s */
+}
+
+void mt_log_softmax(float *x, int n) {
+  /* 🔴 2026-10-01 修复：原来写作 x[i] = log(e_i) - (log s + m)，把 m 减了两次
+   *   （log(e_i)=x_i-m，正确结果是 x_i-m-log s）。greedy 走 argmax 对常数平移不敏感，
+   *   所以只在 beam search 里暴露。 */
+  mt_log_softmax_rows(x, n, NULL, 1);
+  (void)0;
 }
 
 /* argmax：**严格 > ⇒ 并列取最小下标**（与标量版逐位等价，见下）
@@ -341,10 +534,12 @@ void mt_log_softmax(float *x, int n) {
 int mt_argmax(const float *x, int n) {
   int best = 0; float bv = x[0];
 #ifdef _OPENMP
-  if (n >= 4096) {
-    int nt = omp_get_max_threads();
-    int T = nt > 8 ? 8 : nt;
-    float pv[8]; int pi[8];
+  /* 🆕 线程数由工作量派生（MT_LS_PER_THREAD），不再硬编码 8、也不再直接用
+   *   omp_get_max_threads()：128 核机器上 V=30008 只够 8 个 chunk，多起的线程全是净亏。 */
+  int T = mt_chunk_threads(n);
+  if (n >= 4096 && T >= 2) {
+    if (T > 64) T = 64;
+    float pv[64]; int pi[64];
 #pragma omp parallel for schedule(static) num_threads(T)
     for (int t = 0; t < T; t++) {
       const int lo = (int)((long)t * n / T), hi = (int)((long)(t + 1) * n / T);

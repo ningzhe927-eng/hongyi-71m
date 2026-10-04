@@ -8,6 +8,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+/* ---- 每算子"值不值得开并行区"的工作量门槛 ----
+ * 与 MT_OMP_MIN（vnni_gemm.c）同一纪律：env 化，现场扫描定默认值，不必反复重编。
+ * 动机：解码一步内有 ~33 个 OMP 区，小工作量下 fork/join 本身就是净开销（8 核约 2µs、
+ * 128 核上唤醒 16+ 线程约 10~20µs）。这些开关**不影响数值**：涉及的算子要么逐元素、
+ * 要么行/头间独立、无跨任务归约。 */
+static int mt_omp_min_elem(void) {     /* silu：元素数 = M * DF */
+  static int v = -1;
+  if (v < 0) { const char *s = getenv("MT_OMP_MIN_ELEM");  v = (s && *s) ? atoi(s) : 16384; }
+  return v;
+}
+static int mt_omp_min_split(void) {    /* qkv_split：任务数 = B * L * HS */
+  static int v = -1;
+  if (v < 0) { const char *s = getenv("MT_OMP_MIN_SPLIT"); v = (s && *s) ? atoi(s) : 256; }
+  return v;
+}
+
 /* ---- QK 点积：一次算 8 个 key（不改数值） ----
  * 🔴 为什么不能像 `dot8` 那样用 8 路 SIMD 归约：那会**重排求和顺序**，ULP 级误差经 int8
  *    激活量化边界放大后**真的会改译文**（实测 300 句里 16 句不同）。
@@ -178,7 +195,11 @@ static void swiglu(mt_ctx_t *c, const float *x, float *y, int M,
    *      实测 fp32 batch=16 −19%、beam4 −29%（而 int8 档 +17%）。
    *   ✅ 逐元素 ⇒ 行间无依赖、无归约 ⇒ **不改数值**（已用 300 句 diff=0 验证）。 */
   { MT_PROF_B0();
-    const int par = (mt_blas_get_threads() == 0) && (M > 1);
+    /* 🆕 加工作量门槛（MT_OMP_MIN_ELEM，默认 16384 个元素）：b1 解码 M=4 ⇒ 4×1621=6484
+     *   < 门槛 ⇒ 不开并行区（省一次 fork/join，8 核上约 2µs、128 核上约 20µs）；
+     *   b8/b16（M=32/64）与编码（M=B·L）照旧开。逐元素无归约 ⇒ 并行与否**不改数值**。 */
+    const int par = (mt_blas_get_threads() == 0) && (M > 1)
+                    && ((long)M * DF >= mt_omp_min_elem());
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if(par)
 #endif
@@ -220,6 +241,14 @@ static void self_attn(mt_model_t *m, mt_ctx_t *c, const float *x, float *y,
     mt_lin_apply_bias(c->qkvg, x, &W->in_gate, W->in_b, M);
     MT_PROF_E0(PROF_QKVPROJ); }
   { MT_PROF_B0();
+    /* 🆕 这一段是**纯 memcpy**（q/k/v 三个 304B 小块 × HS 个头），无浮点、无归约
+     *   ⇒ 并行**绝对不改数值**（PROF 里它排第 7，b16 约 160ms）。
+     *   门槛 MT_OMP_MIN_SPLIT（默认 256 个 (b,l,h) 任务）：b1 只有 32 个任务 ⇒ 不开；
+     *   b8=256、b16=512、编码 M=B·L 更大 ⇒ 开。 */
+    const int par_split = (mt_blas_get_threads() == 0) && (B * L * HS >= mt_omp_min_split());
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static) if(par_split)
+#endif
     for (int b = 0; b < B; b++)
       for (int l = 0; l < L; l++) {
         const float *base = c->qkvg + ((size_t)b * L + l) * 4 * D_D;
@@ -476,7 +505,16 @@ void mt_decode_step(mt_model_t *m, mt_ctx_t *c, const int *tgt_ids, int B, int L
   for (int i = 0; i < N_DEC; i++) dec_block(m, c, c->b1, B, L, i, &m->dec[i]);
   mt_rmsnorm(c->b1, c->b1, m->dec_final_norm, B * L, D_D, EPSF);
   { MT_PROF_B0();
-    for (int b = 0; b < B; b++)
-      mt_lin_apply(logits + (size_t)b * V, c->b1 + ((size_t)b * L + L - 1) * D_D, &m->tok_embed, 1);
+    if (B > 1) {
+      /* gather：把每行最后位置的隐状态拷成连续 (B,D)（纯 memcpy 不改数值）。
+       * b2 此刻已死（dec_block 循环结束后不再使用），容量 B*maxL*D ≥ B*D。
+       * 🔴 别在 final rmsnorm 与这里之间插入 b2 的其它使用。 */
+      for (int b = 0; b < B; b++)
+        memcpy(c->b2 + (size_t)b * D_D, c->b1 + ((size_t)b * L + L - 1) * D_D,
+               D_D * sizeof(float));
+      mt_lin_apply_batched(logits, c->b2, &m->tok_embed, B);
+    } else {
+      mt_lin_apply(logits, c->b1 + (size_t)(L - 1) * D_D, &m->tok_embed, 1);
+    }
     MT_PROF_E0(PROF_LMHEAD); }
 }

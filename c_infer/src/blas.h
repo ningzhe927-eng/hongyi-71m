@@ -21,6 +21,8 @@ typedef struct {
 } mt_lin_t;
 
 void mt_lin_apply(float *y, const float *x, const mt_lin_t *W, int M);
+/* 与「M 次 mt_lin_apply(y+m*N, x+m*K, W, 1)」逐位等价（int8 档）；fp32 档保持逐行 sgemv。 */
+void mt_lin_apply_batched(float *y, const float *x, const mt_lin_t *W, int M);
 void mt_lin_apply_bias(float *y, const float *x, const mt_lin_t *W, const float *b, int M);
 
 #endif /* MT_BLAS_H */

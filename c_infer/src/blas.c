@@ -76,6 +76,20 @@ void mt_lin_apply(float *y, const float *x, const mt_lin_t *W, int M) {
   else        mt_gemm_q8(y, x, W->w8, W->wscale, W->wrowsum, M, W->N, W->K);
 }
 
+void mt_lin_apply_batched(float *y, const float *x, const mt_lin_t *W, int M) {
+  if (W->w32) {  /* fp32：sgemv(M=1) 与 sgemm(M>1) 累加序不同，不保证逐位一致 ⇒ 保持逐行 */
+    for (int m = 0; m < M; m++)
+      mt_linear_nobias(y + (size_t)m * W->N, x + (size_t)m * W->K, W->w32, 1, W->N, W->K);
+    return;
+  }
+  /* 🔴 逐位等价论证（beam k×batch b 与 batch1 逐位 diff=0 门槛依赖它）：
+   * ① int32 累加精确（单点积 ≤ K·127·255 ≪ 2^31）⇒ 结果与 M、分块、OMP 线程划分无关；
+   * ② 浮点只在 epilogue (float)corr * as[m] * wscale[n]，每个 (m,n) 独立、操作数与
+   *    运算顺序同 M=1 完全一致；③ 激活量化按行独立（每行单独 amax/scale）。
+   * ⇒ 一次 M=R 与 R 次 M=1 逐位相同（vnni_gemm.c 顶部注释，memcmp 已验证 M=1/16/48）。 */
+  mt_gemm_q8(y, x, W->w8, W->wscale, W->wrowsum, M, W->N, W->K);
+}
+
 void mt_lin_apply_bias(float *y, const float *x, const mt_lin_t *W, const float *b, int M) {
   if (W->w32) { mt_linear(y, x, W->w32, b, M, W->N, W->K); return; }  /* 保持已对齐的 fp32 行为 */
   mt_lin_apply(y, x, W, M);

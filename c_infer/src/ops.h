@@ -20,6 +20,10 @@ void mt_softmax_rows(float *x, int rows, int n);
 
 /* 原地 log_softmax（单行 n 个元素） */
 void mt_log_softmax(float *x, int n);
+/* 行级 log_softmax：一次做完 nrows 行的三趟（与「逐行调 mt_log_softmax」逐位等价）。
+ * ridx==NULL ⇒ 行 0..nrows-1；否则是稀疏行表。⚠ 必须从**串行上下文**调用（外层若在
+ * omp parallel 内，嵌套默认关闭 ⇒ 退化为串行 —— 见 decode.c 批内 beam 的改法）。 */
+void mt_log_softmax_rows(float *x, int n, const int *ridx, int nrows);
 
 /* argmax —— 并列取最小下标（复刻 torch.argmax） */
 int mt_argmax(const float *x, int n);

@@ -141,7 +141,10 @@ int mt_beam_search(mt_model_t *m, mt_ctx_t *c,
 
   for (int step = 0; step < max_new; step++) {
     { MT_PROF_B0();
-      for (int b = 0; b < K; b++) mt_log_softmax(logits + (size_t)b * V, V);
+      /* b1 路径是**纯串行 for**（不在 omp parallel 内）⇒ 行内的并行区是真并行。
+       * 改用行级版本：一个 region 覆盖 K 行的全部三趟（原来是每行各自 fork，且第
+       * 三趟的 logf 因 ops.c 阈值单位写错从未并行过，见 ops.c 注释）。 */
+      mt_log_softmax_rows(logits, V, NULL, K);
       MT_PROF_E0(PROF_LOGSOFT); }
 
     int nc = 0;
@@ -337,10 +340,19 @@ static void expand_cross_groups(mt_ctx_t *c, int N, int K) {
 
 }
 
-/* 组内重排：行 (s*K+b) ← 行 (s*K+idx[s*K+b])，逐句独立 */
-static void self_kv_reorder_groups(mt_ctx_t *c, const int *idxg, int N, int K) {
+/* 组内重排：行 (s*K+b) ← 行 (s*K+idx[s*K+b])，逐句独立。
+ * 🆕 P3 降本（数值不变）：
+ * ① done 组整组跳过——行 base 每步都映射到自己（等价于自拷，内容冻结）；
+ *   行 base+1..K-1 变成 stale，但其输出只喂被丢弃的 logits（done 句不进候选、
+ *   cur=tgt_eos），且 self/cross attn 跨组无引用（idxg 恒在组内）⇒ 不影响任何输出。
+ * ② copy-out 自映射跳过（目的=源，memcpy 无操作）。
+ * ③ stage 消去：tmp[p] 只被「映射到 p 的行」读；自映射那次读已随 ② 消去，
+ *   故 cnt[p]−(p 自映射?1:0)==0 的行无需 stage。 */
+static void self_kv_reorder_groups(mt_ctx_t *c, const int *idxg, int N, int K, const int *done) {
   const int cap = c->cap_tgt;
   const int R = N * K;
+  int *cnt = (int *)malloc(sizeof(int) * K);
+  if (!cnt) return;
   for (int i = 0; i < N_DEC; i++) {
     const int len = c->L[i].len;
     if (len <= 0 || len > cap) continue;
@@ -352,26 +364,36 @@ static void self_kv_reorder_groups(mt_ctx_t *c, const int *idxg, int N, int K) {
       g_kvr_buf = (float *)malloc(need * sizeof(float));
       g_kvr_cap = g_kvr_buf ? need : 0;
     }
-    if (!g_kvr_buf) return;
+    if (!g_kvr_buf) { free(cnt); return; }
     float *tmp = g_kvr_buf, *tk = tmp, *tv = tmp + (size_t)R * used;
     float *k = c->L[i].k, *v = c->L[i].v;
-    for (int b = 0; b < R; b++)
-      for (int h = 0; h < HS; h++) {
-        const size_t off = ((size_t)b * HS + h) * cap * DS;
-        const size_t po  = ((size_t)b * HS + h) * seg;
-        memcpy(tk + po, k + off, seg * sizeof(float));
-        memcpy(tv + po, v + off, seg * sizeof(float));
+    for (int s = 0; s < N; s++) {
+      if (done[s]) continue;                       /* ① done 组整组跳过 */
+      const int base = s * K;
+      for (int b = 0; b < K; b++) cnt[b] = 0;
+      for (int b = 0; b < K; b++) cnt[idxg[base + b] - base]++;
+      for (int b = 0; b < K; b++) {                /* copy-in（仅会被读的行） */
+        if (cnt[b] - (idxg[base + b] == base + b ? 1 : 0) <= 0) continue;
+        for (int h = 0; h < HS; h++) {
+          const size_t off = ((size_t)(base + b) * HS + h) * cap * DS;
+          const size_t po  = ((size_t)(base + b) * HS + h) * seg;
+          memcpy(tk + po, k + off, seg * sizeof(float));
+          memcpy(tv + po, v + off, seg * sizeof(float));
+        }
       }
-    for (int b = 0; b < R; b++) {
-      const int p = idxg[b];
-      for (int h = 0; h < HS; h++) {
-        const size_t off = ((size_t)b * HS + h) * cap * DS;
-        const size_t po  = ((size_t)p * HS + h) * seg;
-        memcpy(k + off, tk + po, seg * sizeof(float));
-        memcpy(v + off, tv + po, seg * sizeof(float));
+      for (int b = 0; b < K; b++) {                /* copy-out（跳过自映射） */
+        const int p = idxg[base + b];
+        if (p == base + b) continue;
+        for (int h = 0; h < HS; h++) {
+          const size_t off = ((size_t)(base + b) * HS + h) * cap * DS;
+          const size_t po  = ((size_t)p * HS + h) * seg;
+          memcpy(k + off, tk + po, seg * sizeof(float));
+          memcpy(v + off, tv + po, seg * sizeof(float));
+        }
       }
     }
   }
+  free(cnt);
 }
 
 int mt_beam_search_batch(mt_model_t *m, mt_ctx_t *c,
@@ -384,6 +406,11 @@ int mt_beam_search_batch(mt_model_t *m, mt_ctx_t *c,
   if (K < 2 || N < 1 || c->B != R || c->cap_tgt < max_new + 1) return -1;
   const int stride = max_new + 2;
   mt_beam_dbg = getenv("MT_BEAM_TRACE") != NULL;
+  /* 🆕 尾浪费仪表（MT_TAIL_STAT=1 才打印）：整批要跑到 all_done 才结束，已结束的句子
+   *   的 K 行仍每步参与前向 ⇒ 统计"付了的行数" vs "真正有用的行数"，用来判断值不值得
+   *   做动态批次（refill）。**只测量，不改调度、不改数值**。 */
+  const int tail_stat = getenv("MT_TAIL_STAT") != NULL;
+  long long tail_steps = 0, tail_live = 0;
 
   mt_ctx_reset_kv(c);
   mt_encode(m, c, src_ids, src_pad, N, Lmax);
@@ -407,8 +434,10 @@ int mt_beam_search_batch(mt_model_t *m, mt_ctx_t *c,
   int   *nlens  = (int *)calloc(R, sizeof(int));
   float *nscores= (float *)calloc(R, sizeof(float));
   int   *parents= (int *)malloc(sizeof(int) * (size_t)N * K);
-  float *tv     = (float *)malloc(sizeof(float) * K);
-  int   *ti     = (int *)malloc(sizeof(int) * K);
+  float *tvb    = (float *)malloc(sizeof(float) * (size_t)R * K);
+  int   *tib    = (int *)malloc(sizeof(int) * (size_t)R * K);
+  int   *rlist  = (int *)malloc(sizeof(int) * R);
+  int   *slot   = (int *)malloc(sizeof(int) * N);
   int   *best_seq = (int *)malloc(sizeof(int) * (size_t)N * stride);
   int   *best_len = (int *)calloc(N, sizeof(int));
   float *best_sc  = (float *)malloc(sizeof(float) * N);
@@ -422,7 +451,7 @@ int mt_beam_search_batch(mt_model_t *m, mt_ctx_t *c,
   int   *accp = (int *)malloc(sizeof(int) * (K + 2));
   int   *acct = (int *)malloc(sizeof(int) * (K + 2));
   if (!logits || !cur || !seqs || !lens || !scores || !idxg || !nseq || !nlens || !nscores ||
-      !parents || !tv || !ti || !best_seq || !best_len || !best_sc || !n_live || !n_fin ||
+      !parents || !tvb || !tib || !rlist || !slot || !best_seq || !best_len || !best_sc || !n_live || !n_fin ||
       !done || !cs || !cp || !ct || !accp || !acct) return -1;
   for (int s = 0; s < N; s++) { best_sc[s] = -1e30f; best_len[s] = -1; n_live[s] = 1; n_fin[s] = 0; }
 
@@ -443,11 +472,29 @@ int mt_beam_search_batch(mt_model_t *m, mt_ctx_t *c,
       for (int r = 0; r < R; r++) fprintf(stderr, " %d", mt_argmax(logits + (size_t)r * V, V));
       fprintf(stderr, "\n");
     }
-    for (int s = 0; s < N; s++) if (!done[s]) {
-      MT_PROF_B0();
-      for (int b = 0; b < n_live[s]; b++) mt_log_softmax(logits + (size_t)(s * K + b) * V, V);
-      MT_PROF_E0(PROF_LOGSOFT);
+    /* 行表：与旧逐行版处理集合完全一致（!done[s] && b<n_live[s]，s 升序 b 升序）。
+     * 🔴 逐位一致：每行结果只依赖本行输入、行缓冲互不重叠；mt_log_softmax/mt_topk
+     *   本体未动（其内部 OMP 区嵌套下退化为串行，但行内运算顺序不变）⇒ 跨行并行不改值。
+     *   ⚠ 若将来开启 OMP 嵌套，行内并行会真嵌套——数值仍对，性能塌陷。 */
+    int nrl = 0;
+    for (int s = 0; s < N; s++) {
+      slot[s] = nrl;
+      if (!done[s]) for (int b = 0; b < n_live[s]; b++) rlist[nrl++] = s * K + b;
     }
+    if (tail_stat) { tail_steps++; tail_live += nrl; }   /* 尾浪费仪表（只测量，不改调度） */
+    { MT_PROF_B0();
+      /* 🔴 原来是「外层按行并行 + 行内 mt_log_softmax」：行内的三趟因嵌套默认关闭
+       *   **全部退化成串行**，等于行级并行只用上了 spaced 一小部分；且 schedule(static)
+       *   在 nrl 非线程数倍数时有尾倾斜（nrl=17、T=8 ⇒ 关键路径 3 行 = 理想 1.5×）。
+       *   改成一次调用覆盖全部行的三趟（第三趟用 (行,块) 扁平任务）⇒ 完美均衡。
+       *   数值：每行走的还是同一套 mt_ls_row（行间独立）⇒ 逐位不变。 */
+      mt_log_softmax_rows(logits, V, rlist, nrl);
+      MT_PROF_E0(PROF_LOGSOFT); }
+    { MT_PROF_B0();
+      #pragma omp parallel for schedule(static) if(nrl >= 2)
+      for (int i = 0; i < nrl; i++)
+        mt_topk(logits + (size_t)rlist[i] * V, V, K, tvb + (size_t)i * K, tib + (size_t)i * K);
+      MT_PROF_E0(PROF_TOPK); }
     if (mt_beam_dbg) { int nd = 0; for (int s = 0; s < N; s++) nd += done[s]; fprintf(stderr, "[bstep %d] done=%d/%d\n", step, nd, N); }
 
     int all_done = 1;
@@ -457,12 +504,13 @@ int mt_beam_search_batch(mt_model_t *m, mt_ctx_t *c,
       all_done = 0;
       /* --- 候选池（与原函数同序：按 b 顺序、每行 top-K） --- */
       int nc = 0;
-      MT_PROF_B0();
-      for (int b = 0; b < n_live[s]; b++) {
-        mt_topk(logits + (size_t)(base + b) * V, V, K, tv, ti);
-        for (int k = 0; k < K; k++) { cs[nc] = scores[base + b] + tv[k]; cp[nc] = b; ct[nc] = ti[k]; nc++; }
-      }
-      MT_PROF_E0(PROF_TOPK);
+      /* topk 已在上面的合批段算好（tvb/tib）；这里只拼候选池，读取顺序（b 升序 k 升序）
+       * 与旧版 mt_topk 逐行调用完全一致 ⇒ cs 的浮点加法序列不变 ⇒ 候选/排序/去重逐位一致。 */
+      for (int b = 0; b < n_live[s]; b++)
+        for (int k = 0; k < K; k++) {
+          const size_t sl = (size_t)(slot[s] + b) * K + k;
+          cs[nc] = scores[base + b] + tvb[sl]; cp[nc] = b; ct[nc] = tib[sl]; nc++;
+        }
       for (int i = 0; i < nc; i++) {          /* 稳定降序（与单句版同写法） */
         int bi = i;
         for (int j = i + 1; j < nc; j++) if (cs[j] > cs[bi]) bi = j;
@@ -531,13 +579,19 @@ int mt_beam_search_batch(mt_model_t *m, mt_ctx_t *c,
     }
     if (all_done) break;
 
-    self_kv_reorder_groups(c, idxg, N, K);
+    self_kv_reorder_groups(c, idxg, N, K, done);
     for (int s = 0; s < N; s++)
       for (int b = 0; b < K; b++) {
         const int base = s * K + b;
         cur[base] = done[s] ? tgt_eos : seqs[(size_t)base * stride + lens[base] - 1];
       }
     mt_decode_step(m, c, cur, R, 1, logits);
+  }
+
+  if (tail_stat && tail_steps > 0) {
+    long long paid = tail_steps * (long long)R;
+    fprintf(stderr, "[tail] steps=%lld live_sum=%lld paid=%lld waste=%.1f%%\n",
+            tail_steps, tail_live, paid, 100.0 * (1.0 - (double)tail_live / (double)paid));
   }
 
   for (int s = 0; s < N; s++) {
@@ -552,7 +606,7 @@ int mt_beam_search_batch(mt_model_t *m, mt_ctx_t *c,
   c->enc_pad = (uint8_t *)src_pad;           /* 复原，避免悬垂指针（下次 mt_encode 也会重设）*/
   free(padr);
   free(logits); free(cur); free(seqs); free(lens); free(scores); free(idxg); free(nseq);
-  free(nlens); free(nscores); free(parents); free(tv); free(ti); free(best_seq);
+  free(nlens); free(nscores); free(parents); free(tvb); free(tib); free(rlist); free(slot); free(best_seq);
   free(best_len); free(best_sc); free(n_live); free(n_fin); free(done);
   free(cs); free(cp); free(ct); free(accp); free(acct);
   return rc;
