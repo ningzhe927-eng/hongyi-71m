@@ -7,6 +7,7 @@ English summary below — 中文说明为主。
 ## Highlights / 亮点
 
 - **快**：CPU-only 推理，greedy batch=1 **165.5 句/s**（同机 PyTorch fp32 的 **10.5×**）；batch16 183.6 句/s；beam4 51.7 句/s（Intel icelake, 8 threads）
+- **可移植**：二进制为 **x86-64-v3 基线 + 运行时 ISA 分派**（`avx512vnni / avx2 / scalar` 三路，启动时按 CPU 自动选路，输出逐位一致）——在无 AVX-512 的 CPU（AMD Zen1/2/3、老 Xeon）上不再 SIGILL，avx2 档比标量快 1.4~1.5×
 - **小**：int8 权重直接链入可执行文件（~73MB），运行内存 **65~78 MB**，运行时依赖仅 `libm / libgomp / libc`
 - **干净**：无 Python、无模型框架依赖；单文件二进制即可用
 - 质量（sacrebleu，beam4 lp0.6 cap128，zh→en 用 `13a`、en→zh 用 `zh` 分词）：
@@ -44,6 +45,10 @@ cd c_infer
 cmake -B build -DMT_GEN_DIR=.. -DMT_QUANT8=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j8        # 产物 build/mt_infer
 ```
+
+- `MT_ISA=portable|native`（默认 `portable`）：`portable` = x86-64-v3 基线 + 启动时三路运行时分派；`native` = 按构建机 ISA 直编（仅自用）
+- `MT_TUNE=<arch>`：可选 `-mtune` 微调（只影响调度不改指令集）
+- 运行时 `MT_ISA_FORCE=scalar|avx2|avx512` 可强制选路（启动行 `[isa] ...` 会打印实际分派；逐位一致，可作验证）
 
 ## Model / 模型
 
